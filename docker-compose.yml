@@ -1,0 +1,59 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME:-ncsuparking}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-ncsuparking}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-ncsuparking}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  collector:
+    build: .
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-ncsuparking}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-ncsuparking}
+      POLL_INTERVAL: "${POLL_INTERVAL:-10}"
+      EVENT_POLL_INTERVAL: "${EVENT_POLL_INTERVAL:-3600}"
+      PREDICT_INTERVAL: "${PREDICT_INTERVAL:-60}"
+      RETRAIN_INTERVAL: "${RETRAIN_INTERVAL:-86400}"
+      EVENT_DAYS: "${EVENT_DAYS:-30}"
+      PARKING_API_URL: ${PARKING_API_URL:-https://transportation.ncsu.edu/wp-json/ncsu-transportation-parking-view/v1/get-parking-data}
+      EVENTS_API_URL: ${EVENTS_API_URL:-https://calendar.ncsu.edu/api/2/events}
+    volumes:
+      - models:/app/models
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-ncsuparking}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-ncsuparking}
+    volumes:
+      - models:/app/models
+    ports:
+      - "8501:8501"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  models:
