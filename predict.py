@@ -19,16 +19,26 @@ from features import (
     _load_events_active,
     _load_lot_coords,
     _resample_minutely,
+    event_word_cols,
 )
 from database import save_predictions
 
 logger = logging.getLogger(__name__)
 
 MODEL_DIR = Path("models")
+EVENT_VOCAB_PATH = MODEL_DIR / "event_vocab.json"
 
 # Fetch snapshots from the last N hours.  Must exceed the longest lag
 # (24h = 1440 min) plus margin so that minute-resampling yields enough rows.
 HISTORY_HOURS = 48
+
+
+def _load_event_vocab() -> list[str]:
+    """Event word vocabulary persisted by train.py (empty if never trained)."""
+    if not EVENT_VOCAB_PATH.exists():
+        return []
+    with open(EVENT_VOCAB_PATH) as f:
+        return json.load(f)
 
 
 def _load_latest_snapshots(conn_string: str) -> pd.DataFrame:
@@ -46,8 +56,8 @@ def _load_latest_snapshots(conn_string: str) -> pd.DataFrame:
 
 
 def _build_inference_features(resampled: pd.DataFrame, lot_name: str,
-                              lot_coords: dict,
-                              events: pd.DataFrame) -> pd.Series:
+                              lot_coords: dict, events: pd.DataFrame,
+                              vocab: list[str]) -> pd.Series:
     """Build a single feature row from the *last resampled row* for a lot.
 
     The resampled DataFrame is already on a 1-minute grid.  The last row
@@ -88,9 +98,9 @@ def _build_inference_features(resampled: pd.DataFrame, lot_name: str,
         row[f"rolling_mean_{window}min"] = occ_series.tail(window).mean()
 
     # Event features (uses recorded_at for time overlap)
-    row = _add_event_features(row, lot_coords, events)
+    row = _add_event_features(row, lot_coords, events, vocab=vocab)
 
-    return row[FEATURE_COLS].iloc[0]
+    return row[FEATURE_COLS + event_word_cols(vocab)].iloc[0]
 
 
 def predict_all(conn_string: str | None = None) -> pd.DataFrame:
@@ -126,6 +136,14 @@ def predict_all(conn_string: str | None = None) -> pd.DataFrame:
         max_date=now + timedelta(minutes=FORECAST_MINUTES + 60),
     )
 
+    # Word features use the vocabulary persisted by train.py so the columns
+    # match training exactly.  Existing models trained before word features
+    # are unaffected (empty vocab → base columns only).
+    vocab = _load_event_vocab()
+    feature_cols = FEATURE_COLS + event_word_cols(vocab)
+    logger.info("Event word features: %d (%s).",
+                len(event_word_cols(vocab)), ", ".join(vocab) or "none")
+
     predictions = []
     now_iso = now.isoformat()
 
@@ -136,18 +154,18 @@ def predict_all(conn_string: str | None = None) -> pd.DataFrame:
             continue
 
         # Validate feature columns match training (exact set equality required)
-        train_cols = meta.get("feature_columns", FEATURE_COLS)
-        if set(train_cols) != set(FEATURE_COLS):
+        train_cols = meta.get("feature_columns", feature_cols)
+        if set(train_cols) != set(feature_cols):
             raise ValueError(
                 f"Feature column mismatch for {lot_name}: "
                 f"trained with {sorted(train_cols)}, "
-                f"current FEATURE_COLS has {sorted(FEATURE_COLS)}"
+                f"current feature set has {sorted(feature_cols)}"
             )
 
         model = joblib.load(model_path)
 
         try:
-            features = _build_inference_features(df, lot_name, lot_coords, events)
+            features = _build_inference_features(df, lot_name, lot_coords, events, vocab)
         except ValueError as exc:
             logger.warning("Skipping %s: %s", lot_name, exc)
             continue

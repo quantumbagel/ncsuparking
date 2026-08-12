@@ -13,11 +13,26 @@ import pandas as pd
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
 
-from features import FEATURE_COLS, TARGET_COLS, FORECAST_MINUTES, build_training_data
+from features import (
+    FEATURE_COLS,
+    TARGET_COLS,
+    FORECAST_MINUTES,
+    build_training_data,
+    event_word_cols,
+)
 
 logger = logging.getLogger(__name__)
 
 MODEL_DIR = Path("models")
+EVENT_VOCAB_PATH = MODEL_DIR / "event_vocab.json"
+
+
+def _save_event_vocab(vocab: list[str]) -> None:
+    """Atomically persist the event word vocabulary used for features."""
+    tmp = EVENT_VOCAB_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(vocab, f)
+    os.replace(tmp, EVENT_VOCAB_PATH)
 
 # ── Async training state (shared with the dashboard) ─────────────────────────
 #
@@ -134,19 +149,24 @@ def train_all(conn_string: str | None = None) -> dict:
 
     logger.info("=" * 60)
     logger.info("Building training dataset…")
-    X, y = build_training_data(conn_string)
+    X, y, vocab = build_training_data(conn_string)
+    word_cols = event_word_cols(vocab)
+    feature_names = FEATURE_COLS + word_cols  # consistent across all lots
 
     lots = X["location_name"].unique()
     logger.info("Training models for %d lots…", len(lots))
 
     MODEL_DIR.mkdir(exist_ok=True)
+    # Persist the vocabulary BEFORE training so predictions can rebuild the
+    # exact same feature columns (written atomically).
+    _save_event_vocab(vocab)
+    logger.info("Event word features: %d (%s).",
+                len(word_cols), ", ".join(vocab) or "none")
 
     summary = {
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "lots": {},
     }
-
-    feature_names = FEATURE_COLS  # consistent across all lots
 
     for lot_name in sorted(lots):
         mask = X["location_name"] == lot_name

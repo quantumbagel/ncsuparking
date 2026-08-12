@@ -9,7 +9,6 @@ Features:
 """
 
 import json
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -18,6 +17,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import psycopg2
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from accuracy import EVAL_HORIZONS, compute_accuracy, query_accuracy_history
 from config import Config
@@ -259,7 +259,8 @@ view = st.sidebar.radio(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Data refreshes every few seconds.")
+st.sidebar.caption("Auto-refreshes every 30 seconds.")
+st_autorefresh(interval=30_000, key="dashboard_auto_refresh")
 
 
 # ── Overview ──────────────────────────────────────────────────────────────────
@@ -625,8 +626,6 @@ elif view == "Training":
             f"Training is running (started `{state['started_at']}`).\n\n"
             "You can keep browsing — training continues in the background."
         )
-        time.sleep(10)
-        st.rerun()
     else:
         if state["done"]:
             if state["error"]:

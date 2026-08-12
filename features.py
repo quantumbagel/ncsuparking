@@ -7,6 +7,7 @@ feature matrix X and multi-horizon target matrix y (1440 columns = 24h).
 """
 
 import logging
+import re
 from math import asin, cos, radians, sin, sqrt
 
 import numpy as np
@@ -45,6 +46,21 @@ ONE_MINUTE_NS = np.timedelta64(1, "m")
 EVENT_MAJOR_MIN_NS = np.timedelta64(3, "h")
 EVENT_MAJOR_MAX_NS = np.timedelta64(48, "h")
 
+# ── Event word features ──────────────────────────────────────────────────────
+# Word-level features let the model learn that certain event types (from the
+# title/description, e.g. "soccer") have a bigger impact on parking.  The
+# vocabulary is derived from the training events and persisted by train.py so
+# predictions use the exact same columns.
+EVENT_VOCAB_SIZE = 25          # max words kept as features
+EVENT_VOCAB_MIN_DOCS = 1       # a word must appear in ≥ this many events
+EVENT_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "vs", "at", "of", "in", "on", "to", "a",
+    "nc", "state", "university", "ncsu", "event", "free", "tickets", "ticket",
+    "series", "day", "days", "annual", "presented", "presents", "pm", "am",
+    "time", "times", "join", "us", "come", "see", "info", "information",
+    "click", "register", "registration", "more", "details", "learn", "like",
+})
+
 
 # ── Haversine ─────────────────────────────────────────────────────────────────
 
@@ -56,6 +72,53 @@ def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     dlng = radians(lng2 - lng1)
     a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
     return 2 * r * asin(sqrt(a))
+
+
+# ── Event word features ───────────────────────────────────────────────────────
+
+_EVENT_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _as_text(value) -> str:
+    """Return the string form of a DB value, or '' for NULL/NaN."""
+    return value if isinstance(value, str) else ""
+
+
+def _event_tokens(text: str) -> set[str]:
+    """Lowercased word tokens from event text, minus stopwords/numbers."""
+    if not text:
+        return set()
+    return {
+        tok for tok in _EVENT_TOKEN_RE.findall(text.lower())
+        if len(tok) >= 3 and not tok.isdigit() and tok not in EVENT_STOPWORDS
+    }
+
+
+def _derive_event_vocab(events: pd.DataFrame,
+                        top_k: int = EVENT_VOCAB_SIZE,
+                        min_docs: int = EVENT_VOCAB_MIN_DOCS) -> list[str]:
+    """Top event words across titles+descriptions, used as word features.
+
+    Each event contributes a word at most once (membership, not multiplicity).
+    Words are ranked by frequency, then alphabetically for determinism.
+    """
+    if events.empty:
+        return []
+    counts: dict[str, int] = {}
+    for _, ev in events.iterrows():
+        text = f"{_as_text(ev.get('title', ''))} {_as_text(ev.get('description', ''))}"
+        for tok in _event_tokens(text):
+            counts[tok] = counts.get(tok, 0) + 1
+    ranked = sorted(
+        ((c, w) for w, c in counts.items() if c >= min_docs),
+        key=lambda p: (-p[0], p[1]),
+    )
+    return [w for _, w in ranked[:top_k]]
+
+
+def event_word_cols(vocab: list[str]) -> list[str]:
+    """Feature column names for the given event word vocabulary."""
+    return [f"evword_{w}" for w in vocab]
 
 
 # ── Database queries ─────────────────────────────────────────────────────────
@@ -102,7 +165,7 @@ def _load_events_active(conn_string: str, min_date: pd.Timestamp,
     """Load event instances that fall within [min_date, max_date]."""
     query = """
         SELECT ei.id, ei.event_id, ei.start_time, ei.end_time,
-               e.title, e.location_name, e.latitude, e.longitude
+               e.title, e.description, e.location_name, e.latitude, e.longitude
         FROM event_instances ei
         JOIN events e ON ei.event_id = e.id
         WHERE ei.start_time <= %(max_date)s
@@ -230,7 +293,8 @@ def _to_naive_ns(s: pd.Series) -> np.ndarray:
 
 
 def _add_event_features(df: pd.DataFrame, lot_coords: dict,
-                        events: pd.DataFrame) -> pd.DataFrame:
+                        events: pd.DataFrame,
+                        vocab: list[str] | None = None) -> pd.DataFrame:
     """Add event-proximity features for each snapshot row.
 
     Features (all computed from event instances with geo):
@@ -239,6 +303,11 @@ def _add_event_features(df: pd.DataFrame, lot_coords: dict,
       - minutes_since_last_event   : min end-time behind (500m), capped 24h
       - events_starting_1h/3h/6h/24h : count of instances starting in next N hours (500m)
       - is_major_event_day         : any 3-48h event starts in next 24h (500m)
+      - evword_<word>              : if `vocab` is given, count of events within
+                                     500m whose title/description contains the
+                                     word and that are active now or start in
+                                     the next 24h — lets the model learn that
+                                     e.g. "soccer" events hit parking harder.
 
     Note: the *_starting_* features count *instances* (a recurring event adds
     one per occurrence) — a deliberate proxy for event intensity.
@@ -255,6 +324,13 @@ def _add_event_features(df: pd.DataFrame, lot_coords: dict,
         df[col] = 0
     df["is_major_event_day"] = 0
 
+    # Word-level features: one count column per vocabulary word (all 0 by
+    # default; filled below only for lots within 500m of matching events).
+    word_cols = event_word_cols(vocab or [])
+    if word_cols:
+        for col in word_cols:
+            df[col] = 0
+
     if events.empty:
         return df
 
@@ -263,6 +339,17 @@ def _add_event_features(df: pd.DataFrame, lot_coords: dict,
     ev_ends = _to_naive_ns(events["end_time"])
     ev_lat = events["latitude"].to_numpy(dtype=float)
     ev_lng = events["longitude"].to_numpy(dtype=float)
+
+    # Pre-compute which events contain each vocabulary word (for word features)
+    ev_word_mask = None
+    if word_cols:
+        ev_word_sets = [
+            _event_tokens(f"{_as_text(r.title)} {_as_text(r.description)}")
+            for r in events.itertuples(index=False)
+        ]
+        ev_word_mask = np.array(
+            [[w in ws for w in vocab] for ws in ev_word_sets], dtype=bool,
+        )
 
     for lot_name, (lot_lat, lot_lng) in lot_coords.items():
         mask_lot = df["location_name"] == lot_name
@@ -330,6 +417,22 @@ def _add_event_features(df: pd.DataFrame, lot_coords: dict,
             hi = np.searchsorted(major_starts, t + np.timedelta64(24, "h"), side="right")
             df.loc[mask_lot, "is_major_event_day"] = ((hi - lo) > 0).astype(float)
 
+        # Word-level counts: events within 500m that are active now or start
+        # within the next 24h, bucketed by vocabulary word.
+        if ev_word_mask is not None:
+            starts5 = ev_starts[m500]
+            ends5 = ev_ends[m500]
+            active5 = (t[:, None] >= starts5[None, :]) & (t[:, None] <= ends5[None, :])
+            soon5 = (starts5[None, :] >= t[:, None]) & (
+                starts5[None, :] <= t[:, None] + np.timedelta64(24, "h")
+            )
+            word_counts = (
+                (active5 | soon5).astype(np.int64) @ ev_word_mask[m500].astype(np.int64)
+            )
+            for j, col in enumerate(word_cols):
+                if word_counts[:, j].any():
+                    df.loc[mask_lot, col] = word_counts[:, j]
+
     return df
 
 
@@ -358,8 +461,9 @@ def build_training_data(conn_string: str | None = None,
         min_date: Optional lower bound on parking data (e.g. last 90 days).
 
     Returns:
-        (X, y) DataFrames.  X has FEATURE_COLS + 'location_name'.
+        (X, y, vocab) tuple.  X has FEATURE_COLS + word columns + 'location_name'.
         y has FORECAST_MINUTES target columns (target_1min … target_1440min).
+        vocab is the event word vocabulary used for the word columns.
         Rows where any lag or target is NaN are dropped.
     """
     if conn_string is None:
@@ -381,6 +485,16 @@ def build_training_data(conn_string: str | None = None,
     )
     logger.info("Loaded %d event instances with geo.", len(events))
 
+    # Derive the word vocabulary from these events; it is returned so train.py
+    # can persist it for inference to reuse (identical feature columns).
+    vocab = _derive_event_vocab(events)
+    word_cols = event_word_cols(vocab)
+    if vocab:
+        logger.info("Event word features: %d (%s).", len(word_cols), ", ".join(vocab))
+    else:
+        logger.warning("No event word features — vocabulary is empty "
+                       "(few or no events in the training window).")
+
     # ── Resample to 1-minute grid (critical: makes shifts time-accurate) ──
     df = _resample_minutely(df)
 
@@ -388,21 +502,21 @@ def build_training_data(conn_string: str | None = None,
     df = _add_time_features(df)
     df = _add_lag_features(df)        # depends on 1-min spacing
     df = _add_rolling_features(df)    # depends on 1-min spacing
-    df = _add_event_features(df, lot_coords, events)
+    df = _add_event_features(df, lot_coords, events, vocab=vocab)
 
     # Multi-horizon targets (time-accurate: shift(-1440) = 24h ahead)
     df = _add_targets(df)
 
     # Drop rows missing any feature or target
-    required = FEATURE_COLS + TARGET_COLS
+    required = FEATURE_COLS + word_cols + TARGET_COLS
     before = len(df)
     df = df.dropna(subset=required)
     logger.info("Dropped %d rows with NaN features/targets (%d remaining).",
                 before - len(df), len(df))
 
-    X = df[["location_name"] + FEATURE_COLS].reset_index(drop=True)
+    X = df[["location_name"] + FEATURE_COLS + word_cols].reset_index(drop=True)
     y = df[TARGET_COLS].reset_index(drop=True)
 
     logger.info("Feature matrix: %d rows × %d features.", X.shape[0], X.shape[1] - 1)
     logger.info("Target matrix:   %d rows × %d minute-horizons.", y.shape[0], y.shape[1])
-    return X, y
+    return X, y, vocab
