@@ -440,8 +440,8 @@ def lot_map(mdf: pd.DataFrame, title: str) -> None:
 
 def go_to_forecast(lot: str) -> None:
     st.session_state.selected_lot = lot
-    st.session_state.nav = "Forecast"
-    st.rerun()
+    # Cannot assign key="nav" after the radio exists; apply this next run.
+    st.session_state.pending_nav = "Forecast"
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -449,7 +449,9 @@ def go_to_forecast(lot: str) -> None:
 st.sidebar.title("🅿️ NCSU Parking")
 st.sidebar.caption(f"Times in {Config.TIMEZONE.replace('_', ' ')}")
 
-if "nav" not in st.session_state:
+if "pending_nav" in st.session_state:
+    st.session_state.nav = st.session_state.pop("pending_nav")
+elif "nav" not in st.session_state:
     st.session_state.nav = "Find a spot"
 
 view = st.sidebar.radio("Navigate", NAV_PAGES, key="nav")
@@ -530,8 +532,7 @@ if view == "Find a spot":
             f"({emptiest['At time %']:.0f}% full, ~{emptiest['Est. free']} free)."
         )
         pick = st.selectbox("Open a lot forecast", table["Lot"].tolist())
-        if st.button("Open forecast"):
-            go_to_forecast(pick)
+        st.button("Open forecast", on_click=go_to_forecast, args=(pick,))
 
 
 # ── Forecast ─────────────────────────────────────────────────────────────────
