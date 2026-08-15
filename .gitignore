@@ -21,3 +21,8 @@ Thumbs.db
 
 # Models (trained artifacts)
 models/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/

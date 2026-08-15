@@ -22,18 +22,30 @@ services:
       DB_NAME: ${DB_NAME:-ncsuparking}
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-ncsuparking}
+      TIMEZONE: ${TIMEZONE:-America/New_York}
       POLL_INTERVAL: "${POLL_INTERVAL:-10}"
       EVENT_POLL_INTERVAL: "${EVENT_POLL_INTERVAL:-3600}"
       PREDICT_INTERVAL: "${PREDICT_INTERVAL:-60}"
       RETRAIN_INTERVAL: "${RETRAIN_INTERVAL:-86400}"
+      RETRAIN_CHECK_INTERVAL: "${RETRAIN_CHECK_INTERVAL:-3600}"
+      TRAIN_REQUEST_POLL: "${TRAIN_REQUEST_POLL:-15}"
       EVENT_DAYS: "${EVENT_DAYS:-30}"
+      GRID_MINUTES: "${GRID_MINUTES:-5}"
+      FORECAST_HORIZONS: "${FORECAST_HORIZONS:-15,30,60,120,180,360,720,1440}"
+      PREDICTION_RETENTION_DAYS: "${PREDICTION_RETENTION_DAYS:-14}"
       PARKING_API_URL: ${PARKING_API_URL:-https://transportation.ncsu.edu/wp-json/ncsu-transportation-parking-view/v1/get-parking-data}
       EVENTS_API_URL: ${EVENTS_API_URL:-https://calendar.ncsu.edu/api/2/events}
     volumes:
       - models:/app/models
+    mem_limit: 4g
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pathlib,sys; sys.exit(0 if pathlib.Path('/tmp/collector_ready').exists() else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
   dashboard:
@@ -45,6 +57,7 @@ services:
       DB_NAME: ${DB_NAME:-ncsuparking}
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-ncsuparking}
+      TIMEZONE: ${TIMEZONE:-America/New_York}
     volumes:
       - models:/app/models
     ports:
@@ -52,6 +65,11 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
 volumes:

@@ -1,4 +1,6 @@
-"""Load trained models and predict 24h-ahead occupancy for every lot."""
+"""Predict occupancy at the 8 eval horizons using baseline and/or XGBoost."""
+
+from __future__ import annotations
 
 import json
 import logging
@@ -10,209 +12,146 @@ import numpy as np
 import pandas as pd
 import psycopg2
 
+from baseline import load_baseline, predict_now_plus
+from database import save_predictions
 from features import (
     FEATURE_COLS,
+    FORECAST_HORIZONS,
     FORECAST_MINUTES,
-    LAG_MINUTES,
-    ROLLING_WINDOWS,
-    _add_event_features,
+    add_base_features,
+    build_inference_rows,
+    event_word_cols,
     _load_events_active,
     _load_lot_coords,
-    _resample_minutely,
-    event_word_cols,
+    _load_parking,
+    _resample_grid,
 )
-from database import save_predictions
 
 logger = logging.getLogger(__name__)
 
 MODEL_DIR = Path("models")
 EVENT_VOCAB_PATH = MODEL_DIR / "event_vocab.json"
-
-# Fetch snapshots from the last N hours.  Must exceed the longest lag
-# (24h = 1440 min) plus margin so that minute-resampling yields enough rows.
-HISTORY_HOURS = 48
+HISTORY_HOURS = 8 * 24 + 6  # real week-lag when we have it; else median-filled
 
 
 def _load_event_vocab() -> list[str]:
-    """Event word vocabulary persisted by train.py (empty if never trained)."""
     if not EVENT_VOCAB_PATH.exists():
         return []
     with open(EVENT_VOCAB_PATH) as f:
         return json.load(f)
 
 
-def _load_latest_snapshots(conn_string: str) -> pd.DataFrame:
-    """Return all snapshots from the last HISTORY_HOURS (for minute resampling)."""
-    query = """
-        SELECT recorded_at, location_name, occupancy
-        FROM parking_snapshots
-        WHERE recorded_at >= NOW() - make_interval(hours => %(hours)s)
-        ORDER BY location_name, recorded_at;
-    """
+def _load_summary() -> dict:
+    path = MODEL_DIR / "summary.json"
+    if not path.exists():
+        return {"trained_at": None, "lots": {}}
+    with open(path) as f:
+        return json.load(f)
+
+
+def _known_lots(conn_string: str) -> list[str]:
+    query = "SELECT DISTINCT location_name FROM parking_snapshots ORDER BY location_name;"
     with psycopg2.connect(conn_string) as conn:
-        df = pd.read_sql_query(query, conn, params={"hours": HISTORY_HOURS})
-    df["recorded_at"] = pd.to_datetime(df["recorded_at"], utc=True)
-    return df
-
-
-def _build_inference_features(resampled: pd.DataFrame, lot_name: str,
-                              lot_coords: dict, events: pd.DataFrame,
-                              vocab: list[str]) -> pd.Series:
-    """Build a single feature row from the *last resampled row* for a lot.
-
-    The resampled DataFrame is already on a 1-minute grid.  The last row
-    represents the most recent minute; we use its features to predict the
-    next FORECAST_MINUTES minutes.
-    """
-    lot_df = resampled[resampled["location_name"] == lot_name].sort_values("recorded_at")
-    max_lag = max(LAG_MINUTES)
-    if len(lot_df) <= max_lag:
-        raise ValueError(
-            f"Not enough history for {lot_name} ({len(lot_df)} rows, need > {max_lag})"
-        )
-
-    latest = lot_df.iloc[-1]
-    ts = latest["recorded_at"]
-
-    # Time features from the latest minute grid point
-    row = pd.DataFrame([{
-        "recorded_at": ts,
-        "location_name": lot_name,
-        "hour": ts.hour,
-        "minute_of_hour": ts.minute,
-        "day_of_week": ts.dayofweek,
-        "is_weekend": 1 if ts.dayofweek in (5, 6) else 0,
-        "month": ts.month,
-    }])
-
-    # Lag features: shift relative to the minute grid
-    occ_series = lot_df["occupancy"]
-    for lag_minutes in LAG_MINUTES:
-        row[f"lag_{lag_minutes}min"] = (
-            occ_series.iloc[-1 - lag_minutes]
-            if len(occ_series) > lag_minutes else occ_series.iloc[-1]
-        )
-
-    # Rolling means from the minute grid
-    for window in ROLLING_WINDOWS:
-        row[f"rolling_mean_{window}min"] = occ_series.tail(window).mean()
-
-    # Event features (uses recorded_at for time overlap)
-    row = _add_event_features(row, lot_coords, events, vocab=vocab)
-
-    return row[FEATURE_COLS + event_word_cols(vocab)].iloc[0]
+        with conn.cursor() as cur:
+            cur.execute(query)
+            return [row[0] for row in cur.fetchall()]
 
 
 def predict_all(conn_string: str | None = None) -> pd.DataFrame:
-    """Predict 24h-ahead occupancy for every lot with a trained model.
+    """Predict every known lot at each horizon.
 
-    Returns a DataFrame with columns:
-        lot, predicted_at, horizon_hours, predicted_occupancy
+    Always emits a baseline. Uses XGBoost only when that lot's active_model is
+    ``xgb`` and the feature columns still match.
     """
     if conn_string is None:
         from config import Config
         conn_string = Config.db_conn_string()
 
-    summary_path = MODEL_DIR / "summary.json"
-    if not summary_path.exists():
-        raise FileNotFoundError(
-            f"No {summary_path} found. Run train.py first."
-        )
-    with open(summary_path) as f:
-        summary = json.load(f)
-
-    logger.info("Loading latest snapshots…")
-    raw = _load_latest_snapshots(conn_string)
-    df = _resample_minutely(raw)
-    lot_coords = _load_lot_coords(conn_string)
-
-    # Load events from 24h in the past through +FORECAST_MINUTES + margin,
-    # so past-proximity features (minutes_since_last_event) stay consistent
-    # with training and future features cover the whole forecast horizon.
     now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    baseline_table = load_baseline()
+    summary = _load_summary()
+    vocab = _load_event_vocab()
+    feature_cols = FEATURE_COLS + event_word_cols(vocab)
+
+    raw = _load_parking(conn_string, min_date=pd.Timestamp(now - timedelta(hours=HISTORY_HOURS), tz="UTC"))
+    lots = _known_lots(conn_string)
+    if raw.empty or not lots:
+        logger.warning("No parking snapshots — nothing to predict.")
+        return pd.DataFrame()
+
+    resampled = _resample_grid(raw)
+    lot_coords = _load_lot_coords(conn_string)
     events = _load_events_active(
         conn_string,
         min_date=now - timedelta(hours=24),
         max_date=now + timedelta(minutes=FORECAST_MINUTES + 60),
     )
 
-    # Word features use the vocabulary persisted by train.py so the columns
-    # match training exactly.  Existing models trained before word features
-    # are unaffected (empty vocab → base columns only).
-    vocab = _load_event_vocab()
-    feature_cols = FEATURE_COLS + event_word_cols(vocab)
-    logger.info("Event word features: %d (%s).",
-                len(event_word_cols(vocab)), ", ".join(vocab) or "none")
+    try:
+        featured = add_base_features(resampled, lot_coords, events, vocab)
+    except Exception as exc:
+        logger.error("Feature build failed (%s) — baseline only.", exc)
+        featured = None
 
-    predictions = []
-    now_iso = now.isoformat()
+    predictions: list[dict] = []
+    for lot_name in lots:
+        typical = predict_now_plus(baseline_table, lot_name, now, FORECAST_HORIZONS)
+        model_name = "baseline"
+        preds: dict[int, float] = dict(typical)
 
-    for lot_name, meta in summary["lots"].items():
-        model_path = Path(meta["model_path"])
-        if not model_path.exists():
-            logger.warning("Model file missing: %s — skipping %s", model_path, lot_name)
-            continue
+        meta = (summary.get("lots") or {}).get(lot_name) or {}
+        model_path = meta.get("model_path")
+        active = meta.get("active_model", "baseline")
+        if (
+            featured is not None
+            and active == "xgb"
+            and model_path
+            and Path(model_path).exists()
+        ):
+            train_cols = meta.get("feature_columns", feature_cols)
+            lot_feat = featured[featured["location_name"] == lot_name]
+            try:
+                if set(train_cols) != set(feature_cols):
+                    raise ValueError(
+                        f"feature mismatch trained={sorted(train_cols)} "
+                        f"current={sorted(feature_cols)}"
+                    )
+                rows = build_inference_rows(lot_feat)
+                X = rows.reindex(columns=train_cols)
+                if X.isna().any().any():
+                    raise ValueError("NaN features at inference")
+                model = joblib.load(model_path)
+                yhat = np.clip(model.predict(X), 0, 100)
+                for horizon, value in zip(rows["horizon_minutes"], yhat):
+                    preds[int(horizon)] = float(value)
+                model_name = "xgb"
+            except Exception as exc:
+                logger.warning("Skipping XGB for %s (%s) — using baseline.", lot_name, exc)
 
-        # Validate feature columns match training (exact set equality required)
-        train_cols = meta.get("feature_columns", feature_cols)
-        if set(train_cols) != set(feature_cols):
-            raise ValueError(
-                f"Feature column mismatch for {lot_name}: "
-                f"trained with {sorted(train_cols)}, "
-                f"current feature set has {sorted(feature_cols)}"
-            )
-
-        model = joblib.load(model_path)
-
-        try:
-            features = _build_inference_features(df, lot_name, lot_coords, events, vocab)
-        except ValueError as exc:
-            logger.warning("Skipping %s: %s", lot_name, exc)
-            continue
-
-        # Reindex to training order if needed
-        features = features.reindex(train_cols)
-
-        X_input = features.values.reshape(1, -1)
-        preds = model.predict(X_input)[0]  # shape (FORECAST_MINUTES,)
-
-        # Clip to valid percentage range
-        preds = np.clip(preds, 0, 100)
-
-        for m, occ in enumerate(preds, start=1):
+        for horizon in FORECAST_HORIZONS:
             predictions.append({
                 "lot": lot_name,
                 "predicted_at": now_iso,
-                "horizon_minutes": m,
-                "predicted_occupancy": round(float(occ), 1),
+                "horizon_minutes": int(horizon),
+                "predicted_occupancy": round(preds[horizon], 1),
+                "baseline_occupancy": round(typical[horizon], 1),
+                "model_name": model_name,
             })
 
     result = pd.DataFrame(predictions)
-    logger.info("Predicted %d lots × %dmin = %d rows.",
-                result["lot"].nunique(), FORECAST_MINUTES, len(result))
+    logger.info("Predicted %d lots × %d horizons = %d rows (%s).",
+                result["lot"].nunique() if not result.empty else 0,
+                len(FORECAST_HORIZONS), len(result),
+                "xgb+baseline" if summary.get("lots") else "baseline")
     return result
 
 
-# ── Scheduled prediction ─────────────────────────────────────────────────────
-
-
 def poll_and_predict(conn_string: str | None = None) -> int:
-    """Scheduled prediction wrapper — saves predictions to the database.
-
-    Gracefully skips if no trained models exist yet.
-
-    Returns:
-        Number of prediction rows saved, or 0 if skipped.
-    """
+    """Scheduled prediction wrapper — always tries to write a forecast."""
     if conn_string is None:
         from config import Config
         conn_string = Config.db_conn_string()
-
-    summary_path = MODEL_DIR / "summary.json"
-    if not summary_path.exists():
-        logger.info("No trained models yet (%s not found) — skipping prediction.",
-                     summary_path)
-        return 0
 
     try:
         df = predict_all(conn_string)
@@ -220,13 +159,12 @@ def poll_and_predict(conn_string: str | None = None) -> int:
         logger.error("Prediction failed: %s", exc)
         return 0
 
-    rows = df.to_dict("records")
-    saved = save_predictions(rows)
+    if df.empty:
+        return 0
+    saved = save_predictions(df.to_dict("records"))
     logger.info("Saved %d predictions to database.", saved)
     return saved
 
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -235,4 +173,4 @@ if __name__ == "__main__":
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     preds = predict_all()
-    print(preds.to_string(index=False))
+    print(preds.to_string(index=False) if not preds.empty else "(no predictions)")

@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import psycopg2
 
 from config import Config
+from occupancy import derive_counts
 
 logger = logging.getLogger(__name__)
 
@@ -23,33 +24,36 @@ CREATE TABLE IF NOT EXISTS parking_snapshots (
     occupancy       INTEGER NOT NULL
 );
 
--- Migration: add used_spaces and derive occupancy from raw counts.
--- The occupancy percentage returned by the API is deliberately NOT stored;
--- instead occupancy is recomputed as used / total * 100 so it always agrees
--- with the stored counts.  Idempotent: rewrites only rows that differ.
 ALTER TABLE parking_snapshots ADD COLUMN IF NOT EXISTS used_spaces INTEGER;
 
+-- Clip dirty API counts (negative free = overfull) and keep occupancy in 0–100.
 UPDATE parking_snapshots
-SET used_spaces = GREATEST(0, total_spaces - free_spaces),
+SET used_spaces = GREATEST(0, LEAST(total_spaces,
+                    total_spaces - GREATEST(0, LEAST(free_spaces, total_spaces)))),
     occupancy   = CASE WHEN total_spaces > 0
-                       THEN ROUND(100.0 * GREATEST(0, total_spaces - free_spaces) / total_spaces)
+                       THEN LEAST(100, GREATEST(0, ROUND(
+                           100.0 * GREATEST(0, LEAST(total_spaces,
+                               total_spaces - GREATEST(0, LEAST(free_spaces, total_spaces))))
+                           / total_spaces)))
                        ELSE 0 END
 WHERE used_spaces IS NULL
+   OR occupancy < 0
+   OR occupancy > 100
    OR occupancy IS DISTINCT FROM CASE WHEN total_spaces > 0
-                                      THEN ROUND(100.0 * GREATEST(0, total_spaces - free_spaces) / total_spaces)
+                                      THEN LEAST(100, GREATEST(0, ROUND(
+                                          100.0 * GREATEST(0, LEAST(total_spaces,
+                                              total_spaces - GREATEST(0, LEAST(free_spaces, total_spaces))))
+                                          / total_spaces)))
                                       ELSE 0 END;
 
 ALTER TABLE parking_snapshots ALTER COLUMN used_spaces SET NOT NULL;
 
--- Speed up queries by location + time
 CREATE INDEX IF NOT EXISTS idx_snapshots_location_time
     ON parking_snapshots (location_name, recorded_at DESC);
 
--- Speed up most-recent lookups
 CREATE INDEX IF NOT EXISTS idx_snapshots_recorded_at
     ON parking_snapshots (recorded_at DESC);
 
--- ── Events ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS events (
     id              BIGINT PRIMARY KEY,
     title           TEXT NOT NULL,
@@ -84,34 +88,62 @@ CREATE INDEX IF NOT EXISTS idx_events_dates
 CREATE INDEX IF NOT EXISTS idx_events_location
     ON events (location_name);
 
--- ── Predictions ────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS predictions (
     id                  BIGSERIAL PRIMARY KEY,
     predicted_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     lot                 TEXT NOT NULL,
     horizon_minutes     INTEGER NOT NULL,
-    predicted_occupancy DOUBLE PRECISION NOT NULL
+    predicted_occupancy DOUBLE PRECISION NOT NULL,
+    baseline_occupancy  DOUBLE PRECISION,
+    model_name          TEXT
 );
 
--- Migration: earlier versions of this table used horizon_hours.
--- Add the new column if a pre-existing table lacks it.
 ALTER TABLE predictions ADD COLUMN IF NOT EXISTS horizon_minutes INTEGER;
+ALTER TABLE predictions ADD COLUMN IF NOT EXISTS baseline_occupancy DOUBLE PRECISION;
+ALTER TABLE predictions ADD COLUMN IF NOT EXISTS model_name TEXT;
 
--- ── Accuracy history ──────────────────────────────────────────────────
+-- Drop leftover 1-minute-horizon rows from the old 1440-output models.
+DELETE FROM predictions
+WHERE horizon_minutes IS NULL
+   OR horizon_minutes NOT IN (15, 30, 60, 120, 180, 360, 720, 1440);
+
+DELETE FROM predictions a
+    USING predictions b
+WHERE a.id < b.id
+  AND a.lot = b.lot
+  AND a.predicted_at = b.predicted_at
+  AND a.horizon_minutes = b.horizon_minutes;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_predictions_unique
+    ON predictions (lot, predicted_at, horizon_minutes);
+
+CREATE INDEX IF NOT EXISTS idx_predictions_lot_time
+    ON predictions (lot, predicted_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_predictions_horizon_time
+    ON predictions (horizon_minutes, predicted_at);
+
 CREATE TABLE IF NOT EXISTS accuracy_snapshots (
     id              BIGSERIAL PRIMARY KEY,
     recorded_at     TIMESTAMPTZ NOT NULL,
     horizon_minutes INTEGER NOT NULL,
     mae             DOUBLE PRECISION NOT NULL,
-    n               INTEGER NOT NULL
+    n               INTEGER NOT NULL,
+    model_name      TEXT
 );
+
+ALTER TABLE accuracy_snapshots ADD COLUMN IF NOT EXISTS model_name TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_accuracy_time
     ON accuracy_snapshots (recorded_at DESC);
 
--- Speed up queries for latest predictions
-CREATE INDEX IF NOT EXISTS idx_predictions_lot_time
-    ON predictions (lot, predicted_at DESC);
+CREATE TABLE IF NOT EXISTS collector_heartbeat (
+    name            TEXT PRIMARY KEY,
+    last_poll_at    TIMESTAMPTZ NOT NULL,
+    lots_seen       INTEGER,
+    lots_changed    INTEGER,
+    detail          TEXT
+);
 """
 
 INSERT_SQL = """
@@ -121,6 +153,16 @@ INSERT INTO parking_snapshots
 VALUES
     (%(recorded_at)s, %(location_name)s, %(latitude)s, %(longitude)s,
      %(total_spaces)s, %(free_spaces)s, %(used_spaces)s, %(occupancy)s);
+"""
+
+HEARTBEAT_SQL = """
+INSERT INTO collector_heartbeat (name, last_poll_at, lots_seen, lots_changed, detail)
+VALUES (%(name)s, %(last_poll_at)s, %(lots_seen)s, %(lots_changed)s, %(detail)s)
+ON CONFLICT (name) DO UPDATE SET
+    last_poll_at = EXCLUDED.last_poll_at,
+    lots_seen    = EXCLUDED.lots_seen,
+    lots_changed = EXCLUDED.lots_changed,
+    detail       = EXCLUDED.detail;
 """
 
 
@@ -142,14 +184,7 @@ ORDER BY location_name, recorded_at DESC;
 
 
 def get_last_snapshots() -> dict[str, dict[str, int | float]]:
-    """Return the most recent snapshot for every known lot.
-
-    Returns:
-        Dict keyed by location_name, e.g.:
-        {"MRC Deck": {"free_spaces": 218, "occupancy": 33,
-                       "total_spaces": 324, "used_spaces": 106}}
-        Empty dict if the table has no rows yet.
-    """
+    """Return the most recent snapshot for every known lot."""
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(LAST_STATE_SQL)
@@ -165,28 +200,25 @@ def get_last_snapshots() -> dict[str, dict[str, int | float]]:
     }
 
 
-def insert_snapshot(lot: dict) -> None:
-    """Insert a single parking lot snapshot row."""
-    # Parse geocode "(lat, lng)" -> floats
+def _parse_geocode(lot: dict) -> tuple[float | None, float | None]:
     geocode = lot.get("geocode", "")
-    lat, lng = None, None
-    if geocode:
-        try:
-            parts = geocode.strip("()").split(",")
-            lat, lng = float(parts[0]), float(parts[1])
-        except (ValueError, IndexError):
-            logger.warning("Could not parse geocode: %s", geocode)
+    if not geocode:
+        return None, None
+    try:
+        parts = geocode.strip("()").split(",")
+        return float(parts[0]), float(parts[1])
+    except (ValueError, IndexError):
+        logger.warning("Could not parse geocode: %s", geocode)
+        return None, None
 
-    total = int(lot["total_spaces"])
-    free = int(lot["free_spaces"])
-    # Store raw counts only.  occupancy is derived from the counts (matching
-    # the DB migration) rather than trusting the API's returned percentage.
-    # Integer math mirrors SQL ROUND() exactly (round half away from zero).
-    used = max(0, total - free)
-    occupancy = (200 * used + total) // (2 * total) if total > 0 else 0
 
-    params = {
-        "recorded_at": datetime.datetime.now(datetime.timezone.utc),
+def _snapshot_params(lot: dict, recorded_at: datetime.datetime) -> dict:
+    lat, lng = _parse_geocode(lot)
+    total, free, used, occupancy = derive_counts(
+        int(lot["total_spaces"]), int(lot["free_spaces"]),
+    )
+    return {
+        "recorded_at": recorded_at,
         "location_name": lot["location_name"],
         "latitude": lat,
         "longitude": lng,
@@ -196,6 +228,10 @@ def insert_snapshot(lot: dict) -> None:
         "occupancy": occupancy,
     }
 
+
+def insert_snapshot(lot: dict) -> None:
+    """Insert a single parking lot snapshot row."""
+    params = _snapshot_params(lot, datetime.datetime.now(datetime.timezone.utc))
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(INSERT_SQL, params)
@@ -204,9 +240,50 @@ def insert_snapshot(lot: dict) -> None:
 
 def insert_snapshots(lots: list[dict]) -> int:
     """Insert a batch of parking lot snapshots. Returns count inserted."""
-    for lot in lots:
-        insert_snapshot(lot)
+    if not lots:
+        return 0
+    now = datetime.datetime.now(datetime.timezone.utc)
+    params = [_snapshot_params(lot, now) for lot in lots]
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(INSERT_SQL, params)
+        conn.commit()
     return len(lots)
+
+
+def write_heartbeat(name: str, lots_seen: int = 0, lots_changed: int = 0,
+                    detail: str | None = None) -> None:
+    """Record that a collector job just ran (even if nothing changed)."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(HEARTBEAT_SQL, {
+                "name": name,
+                "last_poll_at": datetime.datetime.now(datetime.timezone.utc),
+                "lots_seen": lots_seen,
+                "lots_changed": lots_changed,
+                "detail": detail,
+            })
+        conn.commit()
+
+
+def get_heartbeat(name: str = "parking") -> dict | None:
+    """Return the latest heartbeat row, or None."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT last_poll_at, lots_seen, lots_changed, detail "
+                "FROM collector_heartbeat WHERE name = %s;",
+                (name,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "last_poll_at": row[0],
+        "lots_seen": row[1],
+        "lots_changed": row[2],
+        "detail": row[3],
+    }
 
 
 # ── Events ───────────────────────────────────────────────────────────────────
@@ -244,10 +321,7 @@ ON CONFLICT (id) DO UPDATE SET
 
 
 def upsert_events(events: list[dict]) -> int:
-    """Insert or update a batch of events from the Localist API.
-
-    Returns count of events upserted.
-    """
+    """Insert or update a batch of events from the Localist API."""
     with _get_conn() as conn:
         with conn.cursor() as cur:
             for ev in events:
@@ -272,11 +346,7 @@ def upsert_events(events: list[dict]) -> int:
 
 
 def upsert_event_instances(instances: list[dict]) -> int:
-    """Insert or update a batch of event instances.
-
-    Each dict should have: id, event_id, start_time, end_time, all_day.
-    Returns count of instances upserted.
-    """
+    """Insert or update a batch of event instances."""
     if not instances:
         return 0
     with _get_conn() as conn:
@@ -296,8 +366,14 @@ def upsert_event_instances(instances: list[dict]) -> int:
 # ── Predictions ──────────────────────────────────────────────────────────────
 
 SAVE_PREDICTIONS_SQL = """
-INSERT INTO predictions (predicted_at, lot, horizon_minutes, predicted_occupancy)
-VALUES (%(predicted_at)s, %(lot)s, %(horizon_minutes)s, %(predicted_occupancy)s);
+INSERT INTO predictions (predicted_at, lot, horizon_minutes,
+                         predicted_occupancy, baseline_occupancy, model_name)
+VALUES (%(predicted_at)s, %(lot)s, %(horizon_minutes)s,
+        %(predicted_occupancy)s, %(baseline_occupancy)s, %(model_name)s)
+ON CONFLICT (lot, predicted_at, horizon_minutes) DO UPDATE SET
+    predicted_occupancy = EXCLUDED.predicted_occupancy,
+    baseline_occupancy  = EXCLUDED.baseline_occupancy,
+    model_name          = EXCLUDED.model_name;
 """
 
 
@@ -312,9 +388,26 @@ def save_predictions(rows: list[dict]) -> int:
     return len(rows)
 
 
+def prune_predictions(retention_days: int | None = None) -> int:
+    """Delete prediction rows older than the retention window."""
+    days = retention_days if retention_days is not None else Config.PREDICTION_RETENTION_DAYS
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM predictions "
+                "WHERE predicted_at < NOW() - make_interval(days => %s);",
+                (days,),
+            )
+            deleted = cur.rowcount
+        conn.commit()
+    if deleted:
+        logger.info("Pruned %d prediction rows older than %d days.", deleted, days)
+    return deleted
+
+
 SAVE_ACCURACY_SQL = """
-INSERT INTO accuracy_snapshots (recorded_at, horizon_minutes, mae, n)
-VALUES (%(recorded_at)s, %(horizon_minutes)s, %(mae)s, %(n)s);
+INSERT INTO accuracy_snapshots (recorded_at, horizon_minutes, mae, n, model_name)
+VALUES (%(recorded_at)s, %(horizon_minutes)s, %(mae)s, %(n)s, %(model_name)s);
 """
 
 

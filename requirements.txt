@@ -10,3 +10,5 @@ joblib>=1.4.0
 streamlit>=1.38.0
 streamlit-autorefresh>=1.0.1
 plotly>=5.22.0
+tzdata>=2024.1
+pytest>=8.0.0

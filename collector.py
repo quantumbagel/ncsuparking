@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import requests
 
 from config import Config
-from database import insert_snapshots, get_last_snapshots
+from database import insert_snapshots, get_last_snapshots, write_heartbeat
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,7 @@ def poll_and_store() -> int:
     lots = fetch_parking_data()
     if not lots:
         logger.warning("No parking data returned; skipping this poll.")
+        write_heartbeat("parking", lots_seen=0, lots_changed=0, detail="empty_api")
         return 0
 
     last_state = get_last_snapshots()
@@ -69,10 +70,12 @@ def poll_and_store() -> int:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         logger.info("[%s] No lots changed since last poll (%d total tracked).",
                      now, len(lots))
+        write_heartbeat("parking", lots_seen=len(lots), lots_changed=0)
         return 0
 
     count = insert_snapshots(changed)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     logger.info("[%s] %d/%d lots changed — stored %d snapshots.",
                  now, count, len(lots), count)
+    write_heartbeat("parking", lots_seen=len(lots), lots_changed=count)
     return count

@@ -1,9 +1,6 @@
-"""Prediction-vs-actual accuracy tracking.
+"""Prediction-vs-actual accuracy tracking."""
 
-Joins stored predictions to the observed occupancy (the most recent snapshot
-at or before each forecast time — matching the forward-fill semantics used in
-feature engineering) and computes per-lot MAE at representative horizons.
-"""
+from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
@@ -16,15 +13,14 @@ from database import save_accuracy_snapshots
 
 logger = logging.getLogger(__name__)
 
-# Representative horizons to evaluate (minutes)
-EVAL_HORIZONS = [15, 30, 60, 120, 180, 360, 720, 1440]
+EVAL_HORIZONS = list(Config.FORECAST_HORIZONS)
 
 
 def compute_accuracy(conn_string: str | None = None,
                      hours_back: int = 24) -> pd.DataFrame:
-    """Return per-lot MAE at representative horizons over the last `hours_back`.
+    """Return per-lot MAE at eval horizons over the last ``hours_back``.
 
-    Returns a DataFrame with columns: lot, horizon_minutes, mae, n.
+    Columns: lot, horizon_minutes, mae, baseline_mae, n, model_name.
     """
     if conn_string is None:
         conn_string = Config.db_conn_string()
@@ -33,6 +29,8 @@ def compute_accuracy(conn_string: str | None = None,
         SELECT p.lot,
                p.horizon_minutes,
                p.predicted_occupancy,
+               p.baseline_occupancy,
+               COALESCE(p.model_name, 'unknown') AS model_name,
                s.occupancy AS actual_occupancy
         FROM predictions p
         CROSS JOIN LATERAL (
@@ -54,16 +52,21 @@ def compute_accuracy(conn_string: str | None = None,
             params={"horizons": EVAL_HORIZONS, "hours_back": hours_back},
         )
 
+    empty_cols = ["lot", "horizon_minutes", "mae", "baseline_mae", "n", "model_name"]
     if df.empty:
         logger.info("No matured predictions to evaluate yet.")
-        return pd.DataFrame(columns=["lot", "horizon_minutes", "mae", "n"])
+        return pd.DataFrame(columns=empty_cols)
 
     df["error"] = (df["predicted_occupancy"] - df["actual_occupancy"]).abs()
+    df["baseline_error"] = (df["baseline_occupancy"] - df["actual_occupancy"]).abs()
 
     mae = (
-        df.groupby(["lot", "horizon_minutes"])["error"]
-        .agg(["mean", "count"])
-        .rename(columns={"mean": "mae", "count": "n"})
+        df.groupby(["lot", "horizon_minutes", "model_name"], dropna=False)
+        .agg(
+            mae=("error", "mean"),
+            baseline_mae=("baseline_error", "mean"),
+            n=("error", "count"),
+        )
         .reset_index()
     )
     return mae
@@ -71,7 +74,7 @@ def compute_accuracy(conn_string: str | None = None,
 
 def compute_overall_mae(conn_string: str | None = None,
                         hours_back: int = 24) -> float | None:
-    """Return the sample-weighted mean absolute error across all lots/horizons."""
+    """Sample-weighted mean absolute error across all lots/horizons."""
     mae = compute_accuracy(conn_string, hours_back)
     if mae.empty:
         return None
@@ -79,38 +82,51 @@ def compute_overall_mae(conn_string: str | None = None,
 
 
 def record_accuracy(conn_string: str | None = None, hours_back: int = 24) -> int:
-    """Snapshot current per-horizon MAE into `accuracy_snapshots`.
-
-    Returns the number of rows recorded (0 if nothing matured to evaluate).
-    """
+    """Snapshot current per-horizon MAE into ``accuracy_snapshots``."""
     mae = compute_accuracy(conn_string, hours_back)
     if mae.empty:
         logger.info("Accuracy snapshot skipped — no matured predictions.")
         return 0
 
     ts = datetime.now(timezone.utc)
-    rows = [
-        {
+    rows = []
+    # Weighted overall per horizon (not an unweighted mean of lot MAEs).
+    for horizon, group in mae.groupby("horizon_minutes"):
+        n = int(group["n"].sum())
+        if n == 0:
+            continue
+        rows.append({
             "recorded_at": ts,
-            "horizon_minutes": int(r.horizon_minutes),
-            "mae": float(r.mae),
-            "n": int(r.n),
-        }
-        for r in mae.itertuples(index=False)
-    ]
+            "horizon_minutes": int(horizon),
+            "mae": float((group["mae"] * group["n"]).sum() / n),
+            "n": n,
+            "model_name": "active",
+        })
+        if group["baseline_mae"].notna().any():
+            rows.append({
+                "recorded_at": ts,
+                "horizon_minutes": int(horizon),
+                "mae": float((group["baseline_mae"] * group["n"]).sum() / n),
+                "n": n,
+                "model_name": "baseline",
+            })
     saved = save_accuracy_snapshots(rows)
     logger.info("Recorded %d accuracy snapshots.", saved)
     return saved
 
 
 def query_accuracy_history(conn_string: str | None = None) -> pd.DataFrame:
-    """Return overall (avg) MAE over time, one row per recorded snapshot batch."""
+    """Weighted overall MAE over time, one row per (batch, model_name)."""
     if conn_string is None:
         conn_string = Config.db_conn_string()
     query = """
-        SELECT recorded_at, AVG(mae) AS overall_mae
+        SELECT recorded_at,
+               COALESCE(model_name, 'active') AS model_name,
+               CASE WHEN SUM(n) > 0
+                    THEN SUM(mae * n) / SUM(n)
+                    ELSE AVG(mae) END AS overall_mae
         FROM accuracy_snapshots
-        GROUP BY recorded_at
+        GROUP BY recorded_at, COALESCE(model_name, 'active')
         ORDER BY recorded_at;
     """
     with psycopg2.connect(conn_string) as conn:
